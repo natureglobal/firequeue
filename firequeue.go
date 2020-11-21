@@ -2,6 +2,7 @@ package firequeue
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"fmt"
 	"log"
@@ -35,7 +36,7 @@ func ErrorHandler(fn func(error, *firehose.PutRecordInput)) Option {
 
 // New return new Queue
 func New(fh firehoseiface.FirehoseAPI, opts ...Option) *Queue {
-	q := &Queue{firehose: fh}
+	q := &Queue{firehose: fh, initc: make(chan struct{})}
 	for _, opt := range opts {
 		opt(q)
 	}
@@ -47,8 +48,8 @@ type Queue struct {
 	queue []*firehose.PutRecordInput
 	mu    sync.RWMutex
 
-	initialized bool
-	initMu      sync.Mutex
+	initc  chan struct{}
+	initMu sync.Mutex
 
 	para            int
 	inFlightCounter int32
@@ -77,16 +78,18 @@ func (q *Queue) Stats() Stats {
 func (q *Queue) init() error {
 	q.initMu.Lock()
 	defer q.initMu.Unlock()
-	if q.initialized {
+	select {
+	case <-q.initc:
 		return fmt.Errorf("already initialized")
+	default:
 	}
-	q.initialized = true
 	if q.queueLimit == 0 {
 		q.queueLimit = 100000
 	}
 	if q.para == 0 {
 		q.para = 1
 	}
+	close(q.initc)
 	return nil
 }
 
@@ -163,7 +166,15 @@ func isErrConnectionResetByPeer(err error) bool {
 
 // Send firehorseInput
 func (q *Queue) Send(r *firehose.PutRecordInput) error {
-	// XXX should check if initialized or not?
+	select {
+	case <-q.initc:
+	default:
+		select {
+		case <-time.After(5 * time.Second):
+			return errors.New("loop has not yet started. call Loop() before Send()")
+		case <-q.initc:
+		}
+	}
 	_, err := q.firehose.PutRecord(r)
 	if err == nil {
 		q.successCount.Add(1)

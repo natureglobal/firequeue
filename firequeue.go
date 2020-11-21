@@ -16,14 +16,17 @@ import (
 	"github.com/aws/aws-sdk-go/service/firehose/firehoseiface"
 )
 
+// Option is a type for constructor options
 type Option func(*Queue)
 
+// Parallel is an option to specify the number of parallelism
 func Parallel(i int) Option {
 	return func(q *Queue) {
 		q.para = i
 	}
 }
 
+// ErrorHandler is an option to specify the error handler
 func ErrorHandler(fn func(error, *firehose.PutRecordInput)) Option {
 	return func(q *Queue) {
 		q.errorHandler = fn

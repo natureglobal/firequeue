@@ -1,5 +1,6 @@
 package firequeue
 
+// Stats contains firequeue statistics.
 type Stats struct {
 	Success          int64
 	RetrySuccess     int64

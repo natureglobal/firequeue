@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/firehose"
 	"github.com/aws/aws-sdk-go/service/firehose/firehoseiface"
+	"github.com/cenkalti/backoff/v4"
 )
 
 // Option is a type for constructor options
@@ -120,7 +121,7 @@ func (q *Queue) Loop(ctx context.Context) error {
 	// but it should be taken care of it at higher levels.
 	for {
 		for q.remaining() {
-			q.put()
+			q.put(&backoff.ZeroBackOff{})
 		}
 		// Wait 2 seconds and wait to see if the jobs will accumulate, because they might
 		// come in queue
@@ -133,13 +134,15 @@ func (q *Queue) Loop(ctx context.Context) error {
 }
 
 func (q *Queue) loop(ctx context.Context) {
+	var bf = backoff.NewExponentialBackOff()
+	bf.MaxElapsedTime = 0
 	var nextInterval time.Duration = 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(nextInterval):
-			nextInterval = q.put()
+			nextInterval = q.put(bf)
 		}
 	}
 }
@@ -212,9 +215,10 @@ func (q *Queue) handleError(err error, r *firehose.PutRecordInput) {
 }
 
 // put puts item and returns interval to put next
-func (q *Queue) put() time.Duration {
+func (q *Queue) put(bf backoff.BackOff) time.Duration {
 	r, done := q.shift()
 	if r == nil {
+		bf.Reset()
 		return 3 * time.Second
 	}
 	defer done()
@@ -229,10 +233,10 @@ func (q *Queue) put() time.Duration {
 			q.giveupErrorCount.Add(1)
 			q.handleError(err, r)
 		}
-		// TODO: exponential backoff
-		return time.Second * 10
+		return bf.NextBackOff()
 	}
 	q.retrySuccessCount.Add(1)
+	bf.Reset()
 	// go to the next immediately when jobs are still in the queue
 	return 0
 }

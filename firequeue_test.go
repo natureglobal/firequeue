@@ -97,7 +97,7 @@ func TestQueue(t *testing.T) {
 
 			stats := q.Stats()
 			valid := func(s firequeue.Stats) bool {
-				if s.GiveupError > 0 || s.UnretryableError > 0 || s.QueueFullError > 0 {
+				if s.GiveupError > 0 || s.UnretryableError > 0 || s.QueueFullError > 0 || s.QueueLength > 0 {
 					return false
 				}
 				if s.Success+s.RetrySuccess != trial {

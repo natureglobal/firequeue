@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -110,5 +111,30 @@ func TestQueue(t *testing.T) {
 			}
 		})
 	}
+}
 
+func TestQueue_Loop(t *testing.T) {
+	tf := &testFirehose{}
+	q := firequeue.New(tf,
+		firequeue.MaxQueueLength(100),
+		firequeue.ErrorHandler(func(err error, r *firehose.PutRecordInput) {}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go q.Loop(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	err := q.Loop(ctx)
+	if err == nil || !strings.Contains(err.Error(), "already initialized") {
+		t.Errorf("already initialized error should be occurred but: %s", err)
+	}
+}
+
+func TestQueue_Send(t *testing.T) {
+	tf := &testFirehose{}
+	q := firequeue.New(tf)
+
+	err := q.Send(nil)
+	if err == nil || !strings.Contains(err.Error(), "loop has not yet started") {
+		t.Errorf("loop has not yet started error should be occurred but: %s", err)
+	}
 }

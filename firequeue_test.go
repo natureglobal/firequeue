@@ -47,7 +47,7 @@ type testFirehose struct {
 
 func (tf *testFirehose) PutRecord(*firehose.PutRecordInput) (*firehose.PutRecordOutput, error) {
 	if rand.Intn(10) < 2 {
-		// 一定確率でわざと失敗させる
+		// Letting them fail on purpose with a certain probability
 		return nil, &testAWSError{}
 	}
 	atomic.AddUint32(&tf.counter, 1)

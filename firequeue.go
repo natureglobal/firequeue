@@ -75,6 +75,7 @@ type Queue struct {
 // Stats return queue stats
 func (q *Queue) Stats() Stats {
 	return Stats{
+		QueueLength:      q.len(),
 		Success:          q.successCount.Value(),
 		RetrySuccess:     q.retrySuccessCount.Value(),
 		UnretryableError: q.unretryableErrorCount.Value(),

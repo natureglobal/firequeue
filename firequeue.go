@@ -34,9 +34,16 @@ func ErrorHandler(fn func(error, *firehose.PutRecordInput)) Option {
 	}
 }
 
+// MaxQueueLength is an option to specify max length of in-memory queue
+func MaxQueueLength(length int) Option {
+	return func(q *Queue) {
+		q.maxQueueLength = length
+	}
+}
+
 // New return new Queue
 func New(fh firehoseiface.FirehoseAPI, opts ...Option) *Queue {
-	q := &Queue{firehose: fh, initc: make(chan struct{})}
+	q := &Queue{firehose: fh, initialized: make(chan struct{})}
 	for _, opt := range opts {
 		opt(q)
 	}
@@ -48,14 +55,14 @@ type Queue struct {
 	queue []*firehose.PutRecordInput
 	mu    sync.RWMutex
 
-	initc  chan struct{}
-	initMu sync.Mutex
+	initialized chan struct{}
+	initMu      sync.Mutex
 
 	para            int
 	inFlightCounter int32
 	firehose        firehoseiface.FirehoseAPI
 	errorHandler    func(error, *firehose.PutRecordInput)
-	queueLimit      int
+	maxQueueLength  int
 
 	successCount          expvar.Int
 	retrySuccessCount     expvar.Int
@@ -79,17 +86,17 @@ func (q *Queue) init() error {
 	q.initMu.Lock()
 	defer q.initMu.Unlock()
 	select {
-	case <-q.initc:
-		return fmt.Errorf("already initialized")
+	case <-q.initialized:
+		return fmt.Errorf("already initialized and started the loop")
 	default:
 	}
-	if q.queueLimit == 0 {
-		q.queueLimit = 100000
+	if q.maxQueueLength == 0 {
+		q.maxQueueLength = 100000
 	}
 	if q.para == 0 {
 		q.para = 1
 	}
-	close(q.initc)
+	close(q.initialized)
 	return nil
 }
 
@@ -110,7 +117,7 @@ func (q *Queue) Loop(ctx context.Context) error {
 
 	// draining process:
 	// The draining will continue if enqueuing continues or the Firehose is in failure,
-	// but it should be taken care of with a forced termination at higher levels.
+	// but it should be taken care of it at higher levels.
 	for {
 		for q.remaining() {
 			q.put()
@@ -137,7 +144,6 @@ func (q *Queue) loop(ctx context.Context) {
 	}
 }
 
-// If there is a server error or throttle to retry after an interval
 func isRetryable(err error) bool {
 	if reqfailure, ok := err.(awserr.RequestFailure); ok {
 		// ref. https://github.com/aws/aws-sdk-go/blob/fe72a52350a8962175bb71c531ec9724ce48abd8/aws/request/retryer.go#L228-L250
@@ -156,7 +162,7 @@ func isRetryable(err error) bool {
 		isErrConnectionResetByPeer(err)
 }
 
-// IsErrorRetryable isErrConnectionReset, which is used inside request.IsErrorRetryable,
+// request.isErrConnectionReset, which is used inside request.IsErrorRetryable,
 // intentionally marks false (do not retry) if it contains "read: connection reset".
 // ref. https://github.com/aws/aws-sdk-go/blob/7814a7f61bf93cb54d00a5f97918c5501f07d351/aws/request/connection_reset_error.go#L7-L18
 // However, in firehose, the connection reset by peer error often bursts, so it is to be retry
@@ -167,12 +173,15 @@ func isErrConnectionResetByPeer(err error) bool {
 // Send firehorseInput
 func (q *Queue) Send(r *firehose.PutRecordInput) error {
 	select {
-	case <-q.initc:
+	case <-q.initialized:
+		// nop and continue to send
 	default:
+		// It is useless if a timer is created in every Send invocation, so tuck the "default:" here.
 		select {
-		case <-time.After(5 * time.Second):
+		case <-time.After(2 * time.Second):
 			return errors.New("loop has not yet started. call Loop() before Send()")
-		case <-q.initc:
+		case <-q.initialized:
+			// nop and continue to send
 		}
 	}
 	_, err := q.firehose.PutRecord(r)
@@ -184,10 +193,12 @@ func (q *Queue) Send(r *firehose.PutRecordInput) error {
 		q.unretryableErrorCount.Add(1)
 		return err
 	}
-	if l := q.len(); l >= q.queueLimit {
+	if l := q.len(); l >= q.maxQueueLength {
 		q.queueFullErrorCount.Add(1)
 		return fmt.Errorf("too many jobs accumlated: %d, %w", l, err)
 	}
+	// Actually, race conditions may occur here and make the queue a little longer than maxQueueLength
+	// temporarily, but it's not a big problem and we don't care.
 	q.push(r)
 	return nil
 }

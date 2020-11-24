@@ -253,6 +253,7 @@ func (q *Queue) inFlight() bool {
 }
 
 func (q *Queue) remaining() bool {
+	// XXX race
 	return q.len() > 0 || q.inFlight()
 }
 

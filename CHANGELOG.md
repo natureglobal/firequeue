@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.0.3](https://github.com/natureglobal/firequeue/compare/v0.0.2...v0.0.3) (2020-11-26)
+
+* Use ticker instead of time.After [#5](https://github.com/natureglobal/firequeue/pull/5) ([wreulicke](https://github.com/wreulicke))
+* enhance testing [#4](https://github.com/natureglobal/firequeue/pull/4) ([Songmu](https://github.com/Songmu))
+
 ## [v0.0.2](https://github.com/natureglobal/firequeue/compare/v0.0.1...v0.0.2) (2020-11-22)
 
 * add stats.QueueLength field [#3](https://github.com/natureglobal/firequeue/pull/3) ([Songmu](https://github.com/Songmu))

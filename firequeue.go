@@ -138,11 +138,16 @@ func (q *Queue) loop(ctx context.Context) {
 	var bf = backoff.NewExponentialBackOff()
 	bf.MaxElapsedTime = 0
 	var nextInterval time.Duration = 0
+	// Use 1 instead of 0 because time.NewTicker disallow zero
+	ticker := time.NewTicker(1)
+	defer ticker.Stop()
+
 	for {
+		ticker.Reset(nextInterval)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(nextInterval):
+		case <-ticker.C:
 			nextInterval = q.put(bf)
 		}
 	}

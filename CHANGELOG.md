@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.0.4](https://github.com/natureglobal/firequeue/compare/v0.0.3...v0.0.4) (2022-04-05)
+
+* follow the latest way to install tools [#7](https://github.com/natureglobal/firequeue/pull/7) ([Songmu](https://github.com/Songmu))
+* go1.18 started to panic when ticker.Reset(0) is called [#6](https://github.com/natureglobal/firequeue/pull/6) ([mash](https://github.com/mash))
+
 ## [v0.0.3](https://github.com/natureglobal/firequeue/compare/v0.0.2...v0.0.3) (2020-11-26)
 
 * Use ticker instead of time.After [#5](https://github.com/natureglobal/firequeue/pull/5) ([wreulicke](https://github.com/wreulicke))

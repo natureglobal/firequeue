@@ -137,8 +137,8 @@ func (q *Queue) Loop(ctx context.Context) error {
 func (q *Queue) loop(ctx context.Context) {
 	var bf = backoff.NewExponentialBackOff()
 	bf.MaxElapsedTime = 0
-	var nextInterval time.Duration = 0
-	// Use 1 instead of 0 because time.NewTicker disallow zero
+	// Use 1 instead of 0 because time.NewTicker and ticker.Reset disallow zero
+	var nextInterval time.Duration = 1
 	ticker := time.NewTicker(1)
 	defer ticker.Stop()
 
@@ -244,7 +244,7 @@ func (q *Queue) put(bf backoff.BackOff) time.Duration {
 	q.retrySuccessCount.Add(1)
 	bf.Reset()
 	// go to the next immediately when jobs are still in the queue
-	return 0
+	return 1
 }
 
 func (q *Queue) len() int {

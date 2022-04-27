@@ -55,6 +55,10 @@ func (tf *testFirehose) PutRecord(*firehose.PutRecordInput) (*firehose.PutRecord
 	return &firehose.PutRecordOutput{}, nil
 }
 
+func (tf *testFirehose) PutRecordWithContext(_ context.Context, r *firehose.PutRecordInput, _ ...request.Option) (*firehose.PutRecordOutput, error) {
+	return tf.PutRecord(r)
+}
+
 func TestQueue(t *testing.T) {
 	testCases := []struct {
 		name string

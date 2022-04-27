@@ -212,6 +212,39 @@ func (q *Queue) Send(r *firehose.PutRecordInput) error {
 	return nil
 }
 
+// SendWithContext firehorseInput with context
+func (q *Queue) SendWithContext(ctx context.Context, r *firehose.PutRecordInput) error {
+	select {
+	case <-q.initialized:
+		// nop and continue to send
+	default:
+		// It is useless if a timer is created in every Send invocation, so tuck the "default:" here.
+		select {
+		case <-time.After(2 * time.Second):
+			return errors.New("loop has not yet started. call Loop() before Send()")
+		case <-q.initialized:
+			// nop and continue to send
+		}
+	}
+	_, err := q.firehose.PutRecordWithContext(ctx, r)
+	if err == nil {
+		q.successCount.Add(1)
+		return nil
+	}
+	if !isRetryable(err) {
+		q.unretryableErrorCount.Add(1)
+		return err
+	}
+	if l := q.len(); l >= q.maxQueueLength {
+		q.queueFullErrorCount.Add(1)
+		return fmt.Errorf("too many jobs accumlated: %d, %w", l, err)
+	}
+	// Actually, race conditions may occur here and make the queue a little longer than maxQueueLength
+	// temporarily, but it's not a big problem and we don't care.
+	q.push(r)
+	return nil
+}
+
 func (q *Queue) handleError(err error, r *firehose.PutRecordInput) {
 	if q.errorHandler != nil {
 		q.errorHandler(err, r)

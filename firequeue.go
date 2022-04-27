@@ -181,6 +181,11 @@ func isErrConnectionResetByPeer(err error) bool {
 
 // Send firehorseInput
 func (q *Queue) Send(r *firehose.PutRecordInput) error {
+	return q.SendWithContext(context.Background(), r)
+}
+
+// SendWithContext firehorseInput with context
+func (q *Queue) SendWithContext(ctx context.Context, r *firehose.PutRecordInput) error {
 	select {
 	case <-q.initialized:
 		// nop and continue to send
@@ -193,7 +198,7 @@ func (q *Queue) Send(r *firehose.PutRecordInput) error {
 			// nop and continue to send
 		}
 	}
-	_, err := q.firehose.PutRecord(r)
+	_, err := q.firehose.PutRecordWithContext(ctx, r)
 	if err == nil {
 		q.successCount.Add(1)
 		return nil

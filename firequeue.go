@@ -116,6 +116,8 @@ type Queue struct {
 	unretryableErrorCount expvar.Int
 	// queueFullErrorCount counts queue full errors when Enqueue() is called.
 	queueFullErrorCount expvar.Int
+	// batchLength is length of the latest batch.
+	batchLength expvar.Int
 }
 
 // Stats return queue stats
@@ -257,6 +259,7 @@ func (q *Queue) sendBatch(bf backoff.BackOff) time.Duration {
 		return q.batchInterval
 	}
 	batch := q.createBatch()
+	q.batchLength.Set(int64(len(batch)))
 	if err := q.attemptToSendBatch(batch); err != nil {
 		// Handle non-retryable errors directly.
 		q.handleError(err, batch)

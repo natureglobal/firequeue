@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.0.6](https://github.com/natureglobal/firequeue/compare/v0.0.5...v0.0.6) (2024-01-04)
+
+* Send to firehose asynchronously [#9](https://github.com/natureglobal/firequeue/pull/9) ([paaaaay5](https://github.com/paaaaay5))
+
 ## [v0.0.5](https://github.com/natureglobal/firequeue/compare/v0.0.4...v0.0.5) (2022-04-27)
 
 * Add SendWithContext() [#8](https://github.com/natureglobal/firequeue/pull/8) ([lamanotrama](https://github.com/lamanotrama))

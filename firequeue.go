@@ -124,6 +124,7 @@ type Queue struct {
 func (q *Queue) Stats() Stats {
 	return Stats{
 		QueueLength:      q.len(),
+		BatchLength:      q.batchLength.Value(),
 		Success:          q.successCount.Value(),
 		RetryCount:       q.retryCount.Value(),
 		UnretryableError: q.unretryableErrorCount.Value(),
@@ -260,6 +261,7 @@ func (q *Queue) sendBatch(bf backoff.BackOff) time.Duration {
 	}
 	batch := q.createBatch()
 	q.batchLength.Set(int64(len(batch)))
+
 	if err := q.attemptToSendBatch(batch); err != nil {
 		// Handle non-retryable errors directly.
 		q.handleError(err, batch)

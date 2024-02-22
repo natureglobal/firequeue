@@ -21,7 +21,7 @@ type testAWSError struct {
 }
 
 func (te *testAWSError) Error() string {
-	return "retryable error!"
+	return "retryable error"
 }
 
 func (te *testAWSError) Code() string {
@@ -158,7 +158,7 @@ func TestQueue_Para(t *testing.T) {
 		{
 			name:  "parallel 100",
 			times: 1000,
-			para:  10,
+			para:  100,
 		},
 	}
 

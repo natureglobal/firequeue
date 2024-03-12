@@ -24,8 +24,24 @@ func (te *testAWSError) Error() string {
 	return "retryable error"
 }
 
+type errCodeMode string
+
+const (
+	retryable   errCodeMode = "retryable"
+	unretryable errCodeMode = "unretryable"
+)
+
+var ecm = retryable
+
 func (te *testAWSError) Code() string {
-	return request.ErrCodeResponseTimeout
+	switch ecm {
+	case retryable:
+		return request.ErrCodeResponseTimeout
+	case unretryable:
+		return request.CanceledErrorCode
+	default:
+		return ""
+	}
 }
 
 func (te *testAWSError) Message() string {
@@ -404,6 +420,30 @@ func TestStat_RetryCount(t *testing.T) {
 	time.Sleep(5 * time.Second)
 	stats := q.Stats()
 	if stats.RetryCount == 0 {
+		t.Errorf("retryCount should be more than 0 but: %d", stats.RetryCount)
+	}
+	t.Log(stats)
+}
+
+func TestStat_UnRetryableErrorCount(t *testing.T) {
+	// It means always return unretryable error.
+	fhErrorRate = 10
+	ecm = unretryable
+
+	tf := &testFirehose{}
+	q := firequeue.New(tf, "env", firequeue.BatchSize(1))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go q.Loop(ctx)
+	time.Sleep(1000 * time.Millisecond)
+	err := q.Enqueue(&firehose.Record{})
+	if err != nil {
+		t.Errorf("error should not be occurred but: %s", err)
+	}
+	time.Sleep(5 * time.Second)
+	stats := q.Stats()
+	if stats.UnretryableError == 0 {
 		t.Errorf("retryCount should be more than 0 but: %d", stats.RetryCount)
 	}
 	t.Log(stats)

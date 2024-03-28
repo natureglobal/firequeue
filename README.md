@@ -26,12 +26,12 @@ import (
 func main() {
     sess := session.Must(session.NewSession())
     fh := firehose.New(sess)
-    fq := firequeue.New(fh)
+    fq := firequeue.New(fh, "DELIVERY_STREAM_NAME")
 
     ctx := context.Background()
     go fq.Loop(ctx) // We should start looping before sending items
 
-    err := fq.Send(&firehose.PutRecordInput{...})
+    err := fq.Enqueue(&firehose.Record{...})
     ...
 }
 ```

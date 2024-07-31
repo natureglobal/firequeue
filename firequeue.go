@@ -304,7 +304,7 @@ func (q *Queue) attemptToSendBatch(batch []*firehose.Record) error {
 			return nil
 		}
 		// Retry failed records.
-		if resp != nil && *resp.FailedPutCount > 0 {
+		if resp != nil && resp.FailedPutCount != nil && *resp.FailedPutCount > 0 {
 			q.successCount.Add(int64(len(batch)) - int64(*resp.FailedPutCount))
 			q.retryFailedRecords(batch, resp)
 			return nil
@@ -320,7 +320,7 @@ func (q *Queue) retryFailedRecords(batch []*firehose.Record, resp *firehose.PutR
 	retryRecords := make([]*firehose.Record, 0, *resp.FailedPutCount)
 
 	for i, record := range batch {
-		if resp.RequestResponses[i].ErrorCode != nil {
+		if resp.RequestResponses != nil && resp.RequestResponses[i] != nil && resp.RequestResponses[i].ErrorCode != nil {
 			q.retryCount.Add(1)
 			retryRecords = append(retryRecords, record)
 		}

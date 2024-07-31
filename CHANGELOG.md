@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.0.7](https://github.com/natureglobal/firequeue/compare/v0.0.6...v0.0.7) (2024-07-31)
+
+* be careful handling pointers [#12](https://github.com/natureglobal/firequeue/pull/12) ([mash](https://github.com/mash))
+* [update] readme [#11](https://github.com/natureglobal/firequeue/pull/11) ([paaaaay5](https://github.com/paaaaay5))
+* Add Test for Stats [#10](https://github.com/natureglobal/firequeue/pull/10) ([paaaaay5](https://github.com/paaaaay5))
+
 ## [v0.0.6](https://github.com/natureglobal/firequeue/compare/v0.0.5...v0.0.6) (2024-01-04)
 
 * Send to firehose asynchronously [#9](https://github.com/natureglobal/firequeue/pull/9) ([paaaaay5](https://github.com/paaaaay5))

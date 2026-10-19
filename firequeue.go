@@ -3,86 +3,119 @@ package firequeue
 import (
 	"context"
 	"errors"
-	"expvar"
 	"fmt"
-	"log"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/firehose"
 	"github.com/aws/aws-sdk-go/service/firehose/firehoseiface"
 	"github.com/cenkalti/backoff/v4"
 )
 
-// Option is a type for constructor options
+const (
+	maxRecordBytes       = 1000 * 1024
+	maxBatchBytes        = 4000000
+	maxBatchRecords      = 500
+	billingUnitBytes     = 5 * 1024
+	defaultQueueLength   = 100000
+	defaultQueueBytes    = 64 * 1024 * 1024
+	defaultBatchInterval = 2 * time.Millisecond
+	defaultDrainTimeout  = 10 * time.Second
+	startTimeout         = 2 * time.Second
+	idleInterval         = time.Hour
+)
+
+// Option configures a Queue before Loop starts.
 type Option func(*Queue)
 
-// Parallel is an option to specify the number of parallelism
-func Parallel(i int) Option {
-	return func(q *Queue) {
-		q.para = i
+// Parallel sets the number of concurrent delivery workers.
+func Parallel(n int) Option {
+	if n <= 0 {
+		panic("parallelism must be positive")
 	}
+	return func(q *Queue) { q.para = n }
 }
 
-// ErrorHandler is an option to specify the error handler
+// ErrorHandler receives API errors and their affected records.
+// It must be concurrency-safe, return promptly, and leave record data unchanged.
 func ErrorHandler(fn func(error, []*firehose.Record)) Option {
-	return func(q *Queue) {
-		q.errorHandler = fn
-	}
+	return func(q *Queue) { q.errorHandler = fn }
 }
 
-// MaxQueueLength is an option to specify max length of in-memory queue
-func MaxQueueLength(length int) Option {
-	if length <= 0 {
+// MaxQueueLength bounds pending input events, including in-flight events.
+func MaxQueueLength(n int) Option {
+	if n <= 0 {
 		panic("max queue length must be positive")
 	}
+	return func(q *Queue) { q.maxQueueLength = n }
+}
+
+// MaxQueueBytes bounds pending payload bytes, including in-flight and retry data.
+func MaxQueueBytes(n int) Option {
+	if n <= 0 {
+		panic("max queue bytes must be positive")
+	}
+	return func(q *Queue) { q.maxQueueBytes = n }
+}
+
+// BatchSize bounds Firehose records per request.
+func BatchSize(n int) Option {
+	if n <= 0 || n > maxBatchRecords {
+		panic("batch size must be between 1 and 500")
+	}
+	return func(q *Queue) { q.batchSize = n }
+}
+
+// BatchInterval controls the delay between successful requests with queued data.
+func BatchInterval(interval time.Duration) Option {
+	if interval <= time.Microsecond {
+		panic("batch interval must exceed one microsecond")
+	}
+	return func(q *Queue) { q.batchInterval = interval }
+}
+
+// DrainTimeout bounds delivery after Loop's context ends.
+func DrainTimeout(timeout time.Duration) Option {
+	if timeout <= 0 {
+		panic("drain timeout must be positive")
+	}
+	return func(q *Queue) { q.drainTimeout = timeout }
+}
+
+// Aggregate concatenates payloads without adding delimiters. Callers supply framing.
+// Payloads larger than targetBytes remain separate records, up to the API limit.
+func Aggregate(targetBytes int, maxWait time.Duration) Option {
+	if targetBytes <= 0 || targetBytes > maxRecordBytes || maxWait <= 0 {
+		panic("invalid aggregation size or wait")
+	}
 	return func(q *Queue) {
-		q.maxQueueLength = length
+		q.aggregateBytes = targetBytes
+		q.aggregateWait = maxWait
 	}
 }
 
-// BatchSize is an option to specify batch size
-func BatchSize(length int) Option {
-	if length <= 0 {
-		panic("max queue length must be positive")
-	}
-	// "Each PutRecordBatch request supports up to 500 records."
-	// ref. https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/service/firehose#Client.PutRecordBatch
-	if length > 500 {
-		panic("max queue length must be less than 500")
-	}
-	return func(q *Queue) {
-		q.batchSize = length
-	}
+// AggregationWaitObserver receives each record's aggregation time before its first attempt.
+// The observer must be concurrency-safe and return promptly.
+func AggregationWaitObserver(fn func(time.Duration)) Option {
+	return func(q *Queue) { q.aggregationObserver = fn }
 }
 
-// BatchInterval is an option to specify batch interval
-func BatchInterval(period time.Duration) Option {
-	// API limit is 1000 requests per second per shard(default).
-	// This means an average of 1 request per millisecond.
-	// ref. https://docs.aws.amazon.com/ja_jp/firehose/latest/dev/limits.html#:~:text=Direct%20PUT%20%E3%81%8C%E3%83%87%E3%83%BC%E3%82%BF%E3%82%BD%E3%83%BC%E3%82%B9%E3%81%A8%E3%81%97%E3%81%A6%E8%A8%AD%E5%AE%9A%E3%81%95%E3%82%8C%E3%81%A6%E3%81%84%E3%82%8B%E5%A0%B4%E5%90%88%E3%80%81%E5%90%84%20Kinesis%20Data%20Firehose%20%E3%83%87%E3%83%AA%E3%83%90%E3%83%AA%E3%83%BC%E3%82%B9%E3%83%88%E3%83%AA%E3%83%BC%E3%83%A0%E3%81%AF%E3%80%81PutRecord%E3%81%8A%E3%82%88%E3%81%B3%E3%83%AA%E3%82%AF%E3%82%A8%E3%82%B9%E3%83%88%E3%81%AB%E5%AF%BE%E3%81%97%E3%81%A6%E4%BB%A5%E4%B8%8B%E3%81%AE%E5%90%88%E8%A8%88%E3%82%AF%E3%82%A9%E3%83%BC%E3%82%BF%E3%82%92%E6%8F%90%E4%BE%9B%E3%81%97%E3%81%BE%E3%81%99%E3%80%82PutRecordBatch
-	if period <= 1*time.Microsecond {
-		panic("batch interval must be greater than 1 microsecond")
-	}
-
-	return func(q *Queue) {
-		q.batchInterval = period
-	}
-}
-
-// New return new Queue
-func New(fh firehoseiface.FirehoseAPI, DeliveryStreamName string, opts ...Option) *Queue {
+// New creates a queue without starting its delivery workers.
+func New(fh firehoseiface.FirehoseAPI, streamName string, opts ...Option) *Queue {
 	q := &Queue{
-		queue:              make([]*firehose.Record, 0),
-		workerCh:           make(chan []*firehose.Record),
 		firehose:           fh,
+		DeliveryStreamName: aws.String(streamName),
 		initialized:        make(chan struct{}),
-		DeliveryStreamName: aws.String(DeliveryStreamName),
+		wake:               make(chan struct{}, 1),
+		aggregateWake:      make(chan struct{}, 1),
+		inFlight:           make(map[*queuedRecord]struct{}),
+		para:               1,
+		maxQueueLength:     defaultQueueLength,
+		maxQueueBytes:      defaultQueueBytes,
+		batchSize:          maxBatchRecords,
+		batchInterval:      defaultBatchInterval,
+		drainTimeout:       defaultDrainTimeout,
 	}
 	for _, opt := range opts {
 		opt(q)
@@ -90,270 +123,291 @@ func New(fh firehoseiface.FirehoseAPI, DeliveryStreamName string, opts ...Option
 	return q
 }
 
-// Queue manages a sending list for firehose
+// Queue owns an in-memory queue; it does not provide durable or exactly-once delivery.
 type Queue struct {
-	queue    []*firehose.Record
-	mu       sync.RWMutex
-	workerCh chan []*firehose.Record
+	mu                  sync.Mutex
+	queue               []*queuedRecord
+	current             *queuedRecord
+	inFlight            map[*queuedRecord]struct{}
+	initialized         chan struct{}
+	wake                chan struct{}
+	aggregateWake       chan struct{}
+	started             bool
+	closed              bool
+	para                int
+	maxQueueLength      int
+	maxQueueBytes       int
+	batchSize           int
+	batchInterval       time.Duration
+	drainTimeout        time.Duration
+	aggregateBytes      int
+	aggregateWait       time.Duration
+	aggregationObserver func(time.Duration)
+	firehose            firehoseiface.FirehoseAPI
+	errorHandler        func(error, []*firehose.Record)
+	stats               Stats
 
-	initialized chan struct{}
-	initMu      sync.Mutex
-
-	para                 int
-	inFlightBatchCounter int32
-	maxQueueLength       int
-	firehose             firehoseiface.FirehoseAPI
-	errorHandler         func(error, []*firehose.Record)
-	batchSize            int
-	batchInterval        time.Duration
-	DeliveryStreamName   *string
-
-	// successCount counts successfully sent records when attemptToSendBatch() is called.
-	successCount expvar.Int
-	// retryCount counts retryable records when attemptToSendBatch() is called.
-	retryCount expvar.Int
-	// unretryableErrorCount counts non-retryable batch when attemptToSendBatch() is called.
-	unretryableErrorCount expvar.Int
-	// queueFullErrorCount counts queue full errors when Enqueue() is called.
-	queueFullErrorCount expvar.Int
-	// batchLength is length of the latest batch.
-	batchLength expvar.Int
+	// DeliveryStreamName selects the destination. Do not mutate it after Loop starts.
+	DeliveryStreamName *string
 }
 
-// Stats return queue stats
-func (q *Queue) Stats() Stats {
-	return Stats{
-		QueueLength:      q.len(),
-		BatchLength:      q.batchLength.Value(),
-		Success:          q.successCount.Value(),
-		RetryCount:       q.retryCount.Value(),
-		UnretryableError: q.unretryableErrorCount.Value(),
-		QueueFullError:   q.queueFullErrorCount.Value(),
-	}
+type queuedRecord struct {
+	record    *firehose.Record
+	events    int64
+	createdAt time.Time
+	sealedAt  time.Time
+	attempted bool
 }
 
-func (q *Queue) init() error {
-	q.initMu.Lock()
-	defer q.initMu.Unlock()
+// Enqueue copies the payload. Loop must start within two seconds of the call.
+// Shutdown rejects new input; successful acceptance does not imply S3 persistence.
+func (q *Queue) Enqueue(record *firehose.Record) error {
 	select {
 	case <-q.initialized:
-		return fmt.Errorf("already initialized and started the loop")
 	default:
+		timer := time.NewTimer(startTimeout)
+		defer timer.Stop()
+		select {
+		case <-q.initialized:
+		case <-timer.C:
+			return errors.New("loop has not yet started. call Loop before Enqueue")
+		}
 	}
-	if q.maxQueueLength == 0 {
-		q.maxQueueLength = 100000
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return errors.New("queue is closed")
 	}
-	if q.para == 0 {
-		q.para = 1
+	if record == nil || len(record.Data) == 0 || len(record.Data) > maxRecordBytes {
+		return errors.New("record data must contain between 1 and 1024000 bytes")
 	}
-	if q.batchSize == 0 {
-		q.batchSize = 500
+	if q.stats.PendingEvents >= int64(q.maxQueueLength) || int64(len(record.Data)) > int64(q.maxQueueBytes)-q.stats.PendingBytes {
+		q.stats.QueueFullError++
+		return fmt.Errorf("queue capacity exceeded: %d events, %d bytes pending", q.stats.PendingEvents, q.stats.PendingBytes)
 	}
-	if q.batchInterval == 0 {
-		q.batchInterval = 2 * time.Millisecond
+	wasEmpty := len(q.queue) == 0 && q.current == nil
+	readyWasEmpty := len(q.queue) == 0
+	now := time.Now()
+	q.stats.AcceptedEvents++
+	q.stats.PendingEvents++
+	q.stats.PendingBytes += int64(len(record.Data))
+	if q.aggregateBytes == 0 || len(record.Data) > q.aggregateBytes {
+		q.sealCurrentLocked(now)
+		q.queue = append(q.queue, &queuedRecord{
+			record: &firehose.Record{Data: append([]byte(nil), record.Data...)},
+			events: 1, createdAt: now, sealedAt: now,
+		})
+	} else {
+		if q.current != nil && (len(q.current.record.Data)+len(record.Data) > q.aggregateBytes || now.Sub(q.current.createdAt) >= q.aggregateWait) {
+			q.sealCurrentLocked(now)
+		}
+		if q.current == nil {
+			q.current = &queuedRecord{record: &firehose.Record{}, createdAt: now}
+			select {
+			case q.aggregateWake <- struct{}{}:
+			default:
+			}
+		}
+		q.current.record.Data = append(q.current.record.Data, record.Data...)
+		q.current.events++
+		if len(q.current.record.Data) == q.aggregateBytes {
+			q.sealCurrentLocked(now)
+		}
 	}
-	close(q.initialized)
+	if wasEmpty || readyWasEmpty && len(q.queue) > 0 {
+		q.notify()
+	}
 	return nil
 }
 
-// Loop proceeds jobs in queue
-func (q *Queue) Loop(ctx context.Context) error {
-	if err := q.init(); err != nil {
-		return err
+func (q *Queue) sealCurrentLocked(now time.Time) {
+	if q.current != nil {
+		q.current.sealedAt = now
+		q.queue = append(q.queue, q.current)
+		q.current = nil
 	}
+}
 
+func (q *Queue) notify() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Loop closes input when ctx ends, then drains within the configured timeout.
+// It returns a drain error with remaining counts if delivery cannot finish in time.
+func (q *Queue) Loop(ctx context.Context) error {
+	q.mu.Lock()
+	if q.started {
+		q.mu.Unlock()
+		return errors.New("queue already initialized")
+	}
+	q.started = true
+	close(q.initialized)
+	q.mu.Unlock()
 	var wg sync.WaitGroup
-	wg.Add(q.para)
+	if q.aggregateBytes > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q.aggregateLoop(ctx)
+		}()
+	}
 	for i := 0; i < q.para; i++ {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			q.loop(ctx)
 		}()
 	}
+	<-ctx.Done()
+	q.mu.Lock()
+	q.closed = true
+	q.sealCurrentLocked(time.Now())
+	q.mu.Unlock()
+	drainCtx, cancel := context.WithTimeout(context.Background(), q.drainTimeout)
+	defer cancel()
 	wg.Wait()
-
-	// draining process:
-	var bf = backoff.NewExponentialBackOff()
+	bf := backoff.NewExponentialBackOff()
 	bf.MaxElapsedTime = 0
-
 	for {
-		if q.remaining() {
-			nextInterval := q.sendBatch(bf)
-			time.Sleep(nextInterval)
-			continue
+		if drainCtx.Err() != nil {
+			stat := q.Stats()
+			return fmt.Errorf("drain incomplete: %d events, %d bytes pending: %w", stat.PendingEvents, stat.PendingBytes, drainCtx.Err())
 		}
-		if !q.remaining() {
-			break
+		batch := q.takeBatch()
+		if len(batch) == 0 {
+			return nil
+		}
+		if q.send(drainCtx, batch) {
+			timer := time.NewTimer(bf.NextBackOff())
+			select {
+			case <-timer.C:
+			case <-drainCtx.Done():
+			}
+			timer.Stop()
+		} else {
+			bf.Reset()
 		}
 	}
-	return nil
 }
 
-func (q *Queue) loop(ctx context.Context) {
-	var bf = backoff.NewExponentialBackOff()
-	bf.MaxElapsedTime = 0
-	var nextInterval time.Duration = q.batchInterval
-	ticker := time.NewTicker(q.batchInterval)
-	defer ticker.Stop()
-
+func (q *Queue) aggregateLoop(ctx context.Context) {
+	timer := time.NewTimer(idleInterval)
+	defer timer.Stop()
 	for {
-		ticker.Reset(nextInterval)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			nextInterval = q.sendBatch(bf)
+		case <-q.aggregateWake:
+		case <-timer.C:
 		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		q.mu.Lock()
+		delay := idleInterval
+		if q.current != nil {
+			delay = time.Until(q.current.createdAt.Add(q.aggregateWait))
+			if delay <= 0 {
+				q.sealCurrentLocked(time.Now())
+				q.notify()
+				delay = idleInterval
+			}
+		}
+		q.mu.Unlock()
+		timer.Reset(delay)
 	}
 }
 
-func isRetryable(err error) bool {
-	if reqfailure, ok := err.(awserr.RequestFailure); ok {
-		// ref. https://github.com/aws/aws-sdk-go/blob/fe72a52350a8962175bb71c531ec9724ce48abd8/aws/request/retryer.go#L228-L250
-		switch reqfailure.StatusCode() {
-		case
-			429,
-			500,
-			502,
-			503,
-			504:
-			return true
-		}
-	}
-	return request.IsErrorRetryable(err) ||
-		request.IsErrorThrottle(err) ||
-		isErrConnectionResetByPeer(err)
-}
-
-// request.isErrConnectionReset, which is used inside request.IsErrorRetryable,
-// intentionally marks false (do not retry) if it contains "read: connection reset".
-// ref. https://github.com/aws/aws-sdk-go/blob/7814a7f61bf93cb54d00a5f97918c5501f07d351/aws/request/connection_reset_error.go#L7-L18
-// However, in firehose, the connection reset by peer error often bursts, so it is to be retry
-func isErrConnectionResetByPeer(err error) bool {
-	return strings.Contains(err.Error(), "read: connection reset by peer")
-}
-
-// Enqueue add data to queue
-func (q *Queue) Enqueue(r *firehose.Record) error {
-	select {
-	case <-q.initialized:
-		// nop and continue to send
-	default:
-		// It is useless if a timer is created in every Send invocation, so tuck the "default:" here.
+func (q *Queue) loop(ctx context.Context) {
+	bf := backoff.NewExponentialBackOff()
+	bf.MaxElapsedTime = 0
+	timer := time.NewTimer(q.batchInterval)
+	defer timer.Stop()
+	var notBefore time.Time
+	for {
 		select {
-		case <-time.After(2 * time.Second):
-			return errors.New("loop has not yet started. call Loop() before Send()")
-		case <-q.initialized:
-			// nop and continue to send
+		case <-ctx.Done():
+			return
+		case <-q.wake:
+		case <-timer.C:
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if delay := time.Until(notBefore); delay > 0 {
+			timer.Reset(delay)
+			continue
+		}
+		batch := q.takeBatch()
+		if len(batch) > 0 && q.send(ctx, batch) {
+			notBefore = time.Now().Add(bf.NextBackOff())
+			timer.Reset(time.Until(notBefore))
+		} else {
+			bf.Reset()
+			if len(batch) > 0 {
+				notBefore = time.Now().Add(q.batchInterval)
+			}
+			timer.Reset(q.nextDelay())
 		}
 	}
-	if l := q.len(); l >= q.maxQueueLength {
-		q.queueFullErrorCount.Add(1)
-		return fmt.Errorf("too many jobs accumlated: %d", l)
-	}
-	q.push(r)
-	return nil
 }
 
-func (q *Queue) sendBatch(bf backoff.BackOff) time.Duration {
-	if q.len() == 0 {
+func (q *Queue) nextDelay() time.Duration {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.queue) > 0 {
 		return q.batchInterval
 	}
-	batch := q.createBatch()
-	q.batchLength.Set(int64(len(batch)))
-
-	if err := q.attemptToSendBatch(batch); err != nil {
-		// Handle non-retryable errors directly.
-		q.handleError(err, batch)
-		return bf.NextBackOff()
-	}
-	bf.Reset()
-	return q.batchInterval
+	return idleInterval
 }
 
-func (q *Queue) createBatch() []*firehose.Record {
+func (q *Queue) takeBatch() []*queuedRecord {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	batchSize := q.batchSize
-	if len(q.queue) < batchSize {
-		batchSize = len(q.queue)
+	n := 0
+	bytes := 0
+	for n < len(q.queue) && n < q.batchSize {
+		if bytes+len(q.queue[n].record.Data) > maxBatchBytes {
+			break
+		}
+		bytes += len(q.queue[n].record.Data)
+		n++
 	}
-
-	batch := make([]*firehose.Record, batchSize)
-	copy(batch, q.queue)
-	q.queue = q.queue[batchSize:]
+	batch := make([]*queuedRecord, n)
+	copy(batch, q.queue[:n])
+	for i := 0; i < n; i++ {
+		q.queue[i] = nil
+	}
+	q.queue = q.queue[n:]
+	if len(q.queue) == 0 {
+		q.queue = nil
+	} else {
+		q.notify()
+	}
+	var waits []time.Duration
+	for _, record := range batch {
+		q.inFlight[record] = struct{}{}
+		if !record.attempted {
+			if q.aggregateBytes > 0 && q.aggregationObserver != nil {
+				waits = append(waits, record.sealedAt.Sub(record.createdAt))
+			}
+			record.attempted = true
+		}
+	}
+	q.mu.Unlock()
+	for _, wait := range waits {
+		q.aggregationObserver(wait)
+	}
 	return batch
-}
-
-func (q *Queue) attemptToSendBatch(batch []*firehose.Record) error {
-	atomic.AddInt32(&q.inFlightBatchCounter, 1)
-	defer atomic.AddInt32(&q.inFlightBatchCounter, -1)
-
-	input := &firehose.PutRecordBatchInput{
-		DeliveryStreamName: q.DeliveryStreamName,
-		Records:            batch,
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	resp, err := q.firehose.PutRecordBatchWithContext(ctx, input)
-	if err != nil {
-		// Handle non-retryable errors directly.
-		if !isRetryable(err) {
-			q.unretryableErrorCount.Add(1)
-			q.handleError(err, batch)
-			return nil
-		}
-		// Retry failed records.
-		if resp != nil && resp.FailedPutCount != nil && *resp.FailedPutCount > 0 {
-			q.successCount.Add(int64(len(batch)) - int64(*resp.FailedPutCount))
-			q.retryFailedRecords(batch, resp)
-			return nil
-		}
-		return err
-	}
-
-	q.successCount.Add(int64(len(batch)))
-	return nil
-}
-
-func (q *Queue) retryFailedRecords(batch []*firehose.Record, resp *firehose.PutRecordBatchOutput) {
-	retryRecords := make([]*firehose.Record, 0, *resp.FailedPutCount)
-
-	for i, record := range batch {
-		if resp.RequestResponses != nil && resp.RequestResponses[i] != nil && resp.RequestResponses[i].ErrorCode != nil {
-			q.retryCount.Add(1)
-			retryRecords = append(retryRecords, record)
-		}
-	}
-	q.push(retryRecords...)
-}
-func (q *Queue) handleError(err error, r []*firehose.Record) {
-	if q.errorHandler != nil {
-		q.errorHandler(err, r)
-		return
-	}
-	log.Println(err)
-}
-
-func (q *Queue) len() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	return len(q.queue)
-}
-
-func (q *Queue) inFlightBatch() bool {
-	return atomic.LoadInt32(&q.inFlightBatchCounter) > 0
-}
-
-func (q *Queue) remaining() bool {
-	// XXX race
-	return q.len() > 0 || q.inFlightBatch()
-}
-
-func (q *Queue) push(r ...*firehose.Record) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.queue = append(q.queue, r...)
 }

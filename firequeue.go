@@ -38,6 +38,7 @@ func Parallel(n int) Option {
 }
 
 // ErrorHandler receives API errors and their affected records.
+// It must be concurrency-safe, return promptly, and leave record data unchanged.
 func ErrorHandler(fn func(error, []*firehose.Record)) Option {
 	return func(q *Queue) { q.errorHandler = fn }
 }
@@ -369,22 +370,11 @@ func (q *Queue) nextDelay() time.Duration {
 	if len(q.queue) > 0 {
 		return q.batchInterval
 	}
-	if q.current != nil {
-		delay := time.Until(q.current.createdAt.Add(q.aggregateWait))
-		if delay > 0 {
-			return delay
-		}
-		return 0
-	}
 	return idleInterval
 }
 
 func (q *Queue) takeBatch() []*queuedRecord {
 	q.mu.Lock()
-	now := time.Now()
-	if q.current != nil && now.Sub(q.current.createdAt) >= q.aggregateWait {
-		q.sealCurrentLocked(now)
-	}
 	n := 0
 	bytes := 0
 	for n < len(q.queue) && n < q.batchSize {

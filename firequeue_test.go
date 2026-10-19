@@ -505,6 +505,8 @@ func TestMalformedResponsesDoNotAcknowledgeEvents(t *testing.T) {
 		{"missing count", &firehose.PutRecordBatchOutput{}},
 		{"missing entry", &firehose.PutRecordBatchOutput{FailedPutCount: aws.Int64(0)}},
 		{"nil entry", &firehose.PutRecordBatchOutput{FailedPutCount: aws.Int64(0), RequestResponses: []*firehose.PutRecordBatchResponseEntry{nil}}},
+		{"missing ID", &firehose.PutRecordBatchOutput{FailedPutCount: aws.Int64(0), RequestResponses: []*firehose.PutRecordBatchResponseEntry{{}}}},
+		{"empty ID", &firehose.PutRecordBatchOutput{FailedPutCount: aws.Int64(0), RequestResponses: []*firehose.PutRecordBatchResponseEntry{{RecordId: aws.String("")}}}},
 		{"inconsistent count", &firehose.PutRecordBatchOutput{FailedPutCount: aws.Int64(1), RequestResponses: []*firehose.PutRecordBatchResponseEntry{{}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

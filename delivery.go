@@ -73,6 +73,8 @@ func validateResponse(resp *firehose.PutRecordBatchOutput, count int) error {
 		}
 		if entry.ErrorCode != nil && *entry.ErrorCode != "" {
 			failed++
+		} else if entry.RecordId == nil || *entry.RecordId == "" {
+			return fmt.Errorf("missing PutRecordBatch acknowledgment ID")
 		}
 	}
 	if failed != *resp.FailedPutCount {

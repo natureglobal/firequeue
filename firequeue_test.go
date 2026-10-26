@@ -9,11 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/firehose"
-	"github.com/aws/aws-sdk-go/service/firehose/firehoseiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/firehose"
+	"github.com/aws/aws-sdk-go-v2/service/firehose/types"
+	"github.com/aws/smithy-go"
 	"github.com/natureglobal/firequeue"
 )
 
@@ -33,33 +32,32 @@ const (
 
 var ecm = retryable
 
-func (te *testAWSError) Code() string {
+func (te *testAWSError) ErrorCode() string {
 	switch ecm {
 	case retryable:
-		return request.ErrCodeResponseTimeout
+		return "RequestTimeout"
 	case unretryable:
-		return request.CanceledErrorCode
+		return "InvalidArgumentException"
 	default:
 		return ""
 	}
 }
 
-func (te *testAWSError) Message() string {
+func (te *testAWSError) ErrorMessage() string {
 	return "msg"
 }
 
-func (te *testAWSError) OrigErr() error {
-	return fmt.Errorf("retryable error!")
+func (te *testAWSError) ErrorFault() smithy.ErrorFault {
+	return smithy.FaultUnknown
 }
 
-var _ awserr.Error = (*testAWSError)(nil)
+var _ smithy.APIError = (*testAWSError)(nil)
 
 func init() {
 	rand.Seed(time.Now().UTC().UnixNano())
 }
 
 type testFirehose struct {
-	firehoseiface.FirehoseAPI
 	counter uint32
 }
 
@@ -67,32 +65,32 @@ type testFirehose struct {
 // 0 means no error, 10 means always error.
 var fhErrorRate = 3
 
-func (tf *testFirehose) PutRecordBatch(input *firehose.PutRecordBatchInput) (*firehose.PutRecordBatchOutput, error) {
+func (tf *testFirehose) PutRecordBatch(_ context.Context, input *firehose.PutRecordBatchInput, _ ...func(*firehose.Options)) (*firehose.PutRecordBatchOutput, error) {
 	if rand.Intn(10) >= fhErrorRate {
 		return &firehose.PutRecordBatchOutput{
-			FailedPutCount: aws.Int64(0),
+			FailedPutCount: aws.Int32(0),
 		}, nil
 	}
 
-	var failedPutCounter int64
+	var failedPutCounter int32
 	inputLength := len(input.Records)
-	firehoseResp := make([]*firehose.PutRecordBatchResponseEntry, inputLength)
+	firehoseResp := make([]types.PutRecordBatchResponseEntry, inputLength)
 	for i := 0; i < inputLength; i++ {
 		if rand.Intn(10) < fhErrorRate {
-			firehoseResp[i] = &firehose.PutRecordBatchResponseEntry{
+			firehoseResp[i] = types.PutRecordBatchResponseEntry{
 				ErrorCode:    aws.String("test_error"),
 				ErrorMessage: aws.String("test_error_message"),
 			}
 			failedPutCounter++
 		} else {
-			firehoseResp[i] = &firehose.PutRecordBatchResponseEntry{
+			firehoseResp[i] = types.PutRecordBatchResponseEntry{
 				RecordId: aws.String(fmt.Sprintf("%d", atomic.LoadUint32(&tf.counter))),
 			}
 		}
 	}
 	resp := &firehose.PutRecordBatchOutput{
 		RequestResponses: firehoseResp,
-		FailedPutCount:   aws.Int64(failedPutCounter),
+		FailedPutCount:   aws.Int32(failedPutCounter),
 	}
 
 	if failedPutCounter > 0 {
@@ -101,9 +99,7 @@ func (tf *testFirehose) PutRecordBatch(input *firehose.PutRecordBatchInput) (*fi
 	return resp, nil
 }
 
-func (tf *testFirehose) PutRecordBatchWithContext(_ context.Context, r *firehose.PutRecordBatchInput, _ ...request.Option) (*firehose.PutRecordBatchOutput, error) {
-	return tf.PutRecordBatch(r)
-}
+var _ firequeue.FirehoseAPI = (*testFirehose)(nil)
 
 // success
 func TestQueue(t *testing.T) {
@@ -141,7 +137,7 @@ func TestQueue(t *testing.T) {
 			time.Sleep(1000 * time.Millisecond)
 
 			for i := 0; i < tc.times; i++ {
-				err := q.Enqueue(&firehose.Record{
+				err := q.Enqueue(types.Record{
 					Data: []byte("test"),
 				})
 				if err != nil {
@@ -194,7 +190,7 @@ func TestQueue_Para(t *testing.T) {
 			time.Sleep(1000 * time.Millisecond)
 
 			for i := 0; i < tc.times; i++ {
-				err := q.Enqueue(&firehose.Record{
+				err := q.Enqueue(types.Record{
 					Data: []byte("test"),
 				})
 				if err != nil {
@@ -232,7 +228,7 @@ func TestQueue_SendWithoutLoop(t *testing.T) {
 	tf := &testFirehose{}
 	q := firequeue.New(tf, "env")
 
-	err := q.Enqueue(nil)
+	err := q.Enqueue(types.Record{})
 	if err == nil || !strings.Contains(err.Error(), "loop has not yet started") {
 		t.Errorf("loop has not yet started error should be occurred but: %s", err)
 	}
@@ -280,7 +276,7 @@ func TestQueue_DrainProcess(t *testing.T) {
 			time.Sleep(1000 * time.Millisecond)
 
 			for i := 0; i < tt.count; i++ {
-				err := q.Enqueue(&firehose.Record{
+				err := q.Enqueue(types.Record{
 					Data: []byte("test"),
 				})
 				if err != nil {
@@ -320,7 +316,7 @@ func TestQueue_DrainProcessPara(t *testing.T) {
 			time.Sleep(1000 * time.Millisecond)
 
 			for i := 0; i < tt.count; i++ {
-				err := q.Enqueue(&firehose.Record{
+				err := q.Enqueue(types.Record{
 					Data: []byte("test"),
 				})
 				if err != nil {
@@ -352,7 +348,7 @@ func TestStats(t *testing.T) {
 	time.Sleep(1000 * time.Millisecond)
 
 	for i := 0; i < 100; i++ {
-		err := q.Enqueue(&firehose.Record{
+		err := q.Enqueue(types.Record{
 			Data: []byte("test"),
 		})
 		if err != nil {
@@ -386,11 +382,11 @@ func TestStats_QueueFullError(t *testing.T) {
 	go q.Loop(ctx)
 	time.Sleep(1000 * time.Millisecond)
 
-	err := q.Enqueue(&firehose.Record{})
+	err := q.Enqueue(types.Record{})
 	if err != nil {
 		t.Errorf("error should not be occurred but: %s", err)
 	}
-	err = q.Enqueue(&firehose.Record{})
+	err = q.Enqueue(types.Record{})
 	if err == nil {
 		t.Errorf("error should be occurred but not")
 	}
@@ -412,7 +408,7 @@ func TestStat_RetryCount(t *testing.T) {
 	go q.Loop(ctx)
 	time.Sleep(1000 * time.Millisecond)
 	for i := 0; i < 10; i++ {
-		err := q.Enqueue(&firehose.Record{})
+		err := q.Enqueue(types.Record{})
 		if err != nil {
 			t.Errorf("error should not be occurred but: %s", err)
 		}
@@ -437,7 +433,7 @@ func TestStat_UnRetryableErrorCount(t *testing.T) {
 
 	go q.Loop(ctx)
 	time.Sleep(1000 * time.Millisecond)
-	err := q.Enqueue(&firehose.Record{})
+	err := q.Enqueue(types.Record{})
 	if err != nil {
 		t.Errorf("error should not be occurred but: %s", err)
 	}

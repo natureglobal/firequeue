@@ -1,11 +1,15 @@
 module github.com/natureglobal/firequeue
 
-go 1.14
+go 1.24
 
 require (
-	github.com/aws/aws-sdk-go v1.35.33
+	github.com/aws/aws-sdk-go-v2 v1.47.4
+	github.com/aws/aws-sdk-go-v2/service/firehose v1.52.6
+	github.com/aws/smithy-go v1.28.6
 	github.com/cenkalti/backoff/v4 v4.1.0
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/kr/pretty v0.1.0 // indirect
-	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
+)
+
+require (
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.7 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.7 // indirect
 )

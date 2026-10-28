@@ -6,18 +6,25 @@ import (
 	"expvar"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/firehose"
-	"github.com/aws/aws-sdk-go/service/firehose/firehoseiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/firehose"
+	"github.com/aws/aws-sdk-go-v2/service/firehose/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/cenkalti/backoff/v4"
 )
+
+// FirehoseAPI is the part of *firehose.Client that Queue uses.
+type FirehoseAPI interface {
+	PutRecordBatch(ctx context.Context, params *firehose.PutRecordBatchInput, optFns ...func(*firehose.Options)) (*firehose.PutRecordBatchOutput, error)
+}
 
 // Option is a type for constructor options
 type Option func(*Queue)
@@ -30,7 +37,7 @@ func Parallel(i int) Option {
 }
 
 // ErrorHandler is an option to specify the error handler
-func ErrorHandler(fn func(error, []*firehose.Record)) Option {
+func ErrorHandler(fn func(error, []types.Record)) Option {
 	return func(q *Queue) {
 		q.errorHandler = fn
 	}
@@ -76,10 +83,10 @@ func BatchInterval(period time.Duration) Option {
 }
 
 // New return new Queue
-func New(fh firehoseiface.FirehoseAPI, DeliveryStreamName string, opts ...Option) *Queue {
+func New(fh FirehoseAPI, DeliveryStreamName string, opts ...Option) *Queue {
 	q := &Queue{
-		queue:              make([]*firehose.Record, 0),
-		workerCh:           make(chan []*firehose.Record),
+		queue:              make([]types.Record, 0),
+		workerCh:           make(chan []types.Record),
 		firehose:           fh,
 		initialized:        make(chan struct{}),
 		DeliveryStreamName: aws.String(DeliveryStreamName),
@@ -92,9 +99,9 @@ func New(fh firehoseiface.FirehoseAPI, DeliveryStreamName string, opts ...Option
 
 // Queue manages a sending list for firehose
 type Queue struct {
-	queue    []*firehose.Record
+	queue    []types.Record
 	mu       sync.RWMutex
-	workerCh chan []*firehose.Record
+	workerCh chan []types.Record
 
 	initialized chan struct{}
 	initMu      sync.Mutex
@@ -102,8 +109,8 @@ type Queue struct {
 	para                 int
 	inFlightBatchCounter int32
 	maxQueueLength       int
-	firehose             firehoseiface.FirehoseAPI
-	errorHandler         func(error, []*firehose.Record)
+	firehose             FirehoseAPI
+	errorHandler         func(error, []types.Record)
 	batchSize            int
 	batchInterval        time.Duration
 	DeliveryStreamName   *string
@@ -207,10 +214,14 @@ func (q *Queue) loop(ctx context.Context) {
 	}
 }
 
+// isRetryable keeps the set of retryable errors that firequeue had with
+// aws-sdk-go v1 (request.IsErrorRetryable, request.IsErrorThrottle and the
+// HTTP status codes below).
 func isRetryable(err error) bool {
-	if reqfailure, ok := err.(awserr.RequestFailure); ok {
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) {
 		// ref. https://github.com/aws/aws-sdk-go/blob/fe72a52350a8962175bb71c531ec9724ce48abd8/aws/request/retryer.go#L228-L250
-		switch reqfailure.StatusCode() {
+		switch respErr.HTTPStatusCode() {
 		case
 			429,
 			500,
@@ -220,21 +231,114 @@ func isRetryable(err error) bool {
 			return true
 		}
 	}
-	return request.IsErrorRetryable(err) ||
-		request.IsErrorThrottle(err) ||
-		isErrConnectionResetByPeer(err)
+	return isErrorRetryable(err) || isErrConnectionResetByPeer(err)
 }
 
-// request.isErrConnectionReset, which is used inside request.IsErrorRetryable,
-// intentionally marks false (do not retry) if it contains "read: connection reset".
+// retryableErrorCodes are the API error codes that aws-sdk-go v1 retried:
+// retryableCodes, credsExpiredCodes and throttleCodes in aws/request/retryer.go.
+// v1 also had the client-side codes "RequestError" and "ResponseTimeout".
+// v2 does not use these codes. isErrorRetryable examines
+// smithyhttp.RequestSendError in place of "RequestError".
+var retryableErrorCodes = map[string]struct{}{
+	"RequestTimeout":          {},
+	"RequestTimeoutException": {},
+
+	"ExpiredToken":          {},
+	"ExpiredTokenException": {},
+	"RequestExpired":        {},
+
+	"ProvisionedThroughputExceededException": {},
+	"ThrottledException":                     {},
+	"Throttling":                             {},
+	"ThrottlingException":                    {},
+	"RequestLimitExceeded":                   {},
+	"RequestThrottled":                       {},
+	"RequestThrottledException":              {},
+	"TooManyRequestsException":               {},
+	"PriorRequestNotComplete":                {},
+	"TransactionInProgressException":         {},
+	"EC2ThrottledException":                  {},
+}
+
+// isErrorRetryable follows request.IsErrorRetryable and
+// request.IsErrorThrottle of aws-sdk-go v1 for the errors that the v2 client
+// returns.
+func isErrorRetryable(err error) bool {
+	// v1 did not retry "RequestCanceled". v2 returns *smithy.CanceledError or
+	// *aws.RequestCanceledError when the context is done.
+	var canceledErr interface{ CanceledError() bool }
+	if errors.As(err, &canceledErr) && canceledErr.CanceledError() {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		_, ok := retryableErrorCodes[apiErr.ErrorCode()]
+		return ok
+	}
+	// v1 "SerializationError": v1 retried it when it retried the cause,
+	// and did not retry it without a cause.
+	var deserializationErr *smithy.DeserializationError
+	if errors.As(err, &deserializationErr) {
+		return deserializationErr.Err != nil && shouldRetryError(deserializationErr.Err)
+	}
+	// v1 "RequestError": v1 retried it when it retried the cause,
+	// and retried it without a cause.
+	var sendErr *smithyhttp.RequestSendError
+	if errors.As(err, &sendErr) {
+		return shouldRetryError(sendErr.Err)
+	}
+	// v1 did not retry errors from parameter validation either.
+	return false
+}
+
+// shouldRetryError is the part of request.shouldRetryError in aws-sdk-go v1
+// that examines the causes of "RequestError" and "SerializationError".
+// ref. https://github.com/aws/aws-sdk-go/blob/v1.35.33/aws/request/retryer.go#L168-L226
+func shouldRetryError(err error) bool {
+	switch e := err.(type) {
+	case *url.Error:
+		if strings.Contains(e.Error(), "connection refused") {
+			return true
+		}
+		return shouldRetryError(e.Err)
+	case interface{ Temporary() bool }:
+		if netErr, ok := e.(*net.OpError); ok && netErr.Op == "dial" {
+			return true
+		}
+		return e.Temporary() || isErrConnectionReset(err)
+	case nil:
+		return true
+	default:
+		switch err.Error() {
+		case "net/http: request canceled",
+			"net/http: request canceled while waiting for connection":
+			return false
+		}
+		return true
+	}
+}
+
+// isErrConnectionReset is request.isErrConnectionReset in aws-sdk-go v1.
+// It intentionally marks false (do not retry) if it contains "read: connection reset".
 // ref. https://github.com/aws/aws-sdk-go/blob/7814a7f61bf93cb54d00a5f97918c5501f07d351/aws/request/connection_reset_error.go#L7-L18
-// However, in firehose, the connection reset by peer error often bursts, so it is to be retry
+func isErrConnectionReset(err error) bool {
+	msg := err.Error()
+	if strings.Contains(msg, "read: connection reset") {
+		return false
+	}
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe")
+}
+
+// isErrConnectionResetByPeer catches "read: connection reset by peer", which isErrConnectionReset does not retry.
+// In firehose, the connection reset by peer error often bursts, so it is to be retry
 func isErrConnectionResetByPeer(err error) bool {
 	return strings.Contains(err.Error(), "read: connection reset by peer")
 }
 
 // Enqueue add data to queue
-func (q *Queue) Enqueue(r *firehose.Record) error {
+func (q *Queue) Enqueue(r types.Record) error {
 	select {
 	case <-q.initialized:
 		// nop and continue to send
@@ -271,7 +375,7 @@ func (q *Queue) sendBatch(bf backoff.BackOff) time.Duration {
 	return q.batchInterval
 }
 
-func (q *Queue) createBatch() []*firehose.Record {
+func (q *Queue) createBatch() []types.Record {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -280,13 +384,13 @@ func (q *Queue) createBatch() []*firehose.Record {
 		batchSize = len(q.queue)
 	}
 
-	batch := make([]*firehose.Record, batchSize)
+	batch := make([]types.Record, batchSize)
 	copy(batch, q.queue)
 	q.queue = q.queue[batchSize:]
 	return batch
 }
 
-func (q *Queue) attemptToSendBatch(batch []*firehose.Record) error {
+func (q *Queue) attemptToSendBatch(batch []types.Record) error {
 	atomic.AddInt32(&q.inFlightBatchCounter, 1)
 	defer atomic.AddInt32(&q.inFlightBatchCounter, -1)
 
@@ -297,7 +401,7 @@ func (q *Queue) attemptToSendBatch(batch []*firehose.Record) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := q.firehose.PutRecordBatchWithContext(ctx, input)
+	resp, err := q.firehose.PutRecordBatch(ctx, input)
 	if err != nil {
 		// Handle non-retryable errors directly.
 		if !isRetryable(err) {
@@ -318,18 +422,18 @@ func (q *Queue) attemptToSendBatch(batch []*firehose.Record) error {
 	return nil
 }
 
-func (q *Queue) retryFailedRecords(batch []*firehose.Record, resp *firehose.PutRecordBatchOutput) {
-	retryRecords := make([]*firehose.Record, 0, *resp.FailedPutCount)
+func (q *Queue) retryFailedRecords(batch []types.Record, resp *firehose.PutRecordBatchOutput) {
+	retryRecords := make([]types.Record, 0, *resp.FailedPutCount)
 
 	for i, record := range batch {
-		if resp.RequestResponses != nil && resp.RequestResponses[i] != nil && resp.RequestResponses[i].ErrorCode != nil {
+		if resp.RequestResponses != nil && resp.RequestResponses[i].ErrorCode != nil {
 			q.retryCount.Add(1)
 			retryRecords = append(retryRecords, record)
 		}
 	}
 	q.push(retryRecords...)
 }
-func (q *Queue) handleError(err error, r []*firehose.Record) {
+func (q *Queue) handleError(err error, r []types.Record) {
 	if q.errorHandler != nil {
 		q.errorHandler(err, r)
 		return
@@ -352,7 +456,7 @@ func (q *Queue) remaining() bool {
 	return q.len() > 0 || q.inFlightBatch()
 }
 
-func (q *Queue) push(r ...*firehose.Record) {
+func (q *Queue) push(r ...types.Record) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.queue = append(q.queue, r...)

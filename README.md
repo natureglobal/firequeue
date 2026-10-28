@@ -19,19 +19,21 @@ firequeue is to ensure putting items to Amazon Kinesis Data Firehose with an in-
 import (
     "context"
 
-    "github.com/aws/aws-sdk-go/aws/session"
-    "github.com/aws/aws-sdk-go/service/firehose"
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/firehose"
+    "github.com/aws/aws-sdk-go-v2/service/firehose/types"
 )
 
 func main() {
-    sess := session.Must(session.NewSession())
-    fh := firehose.New(sess)
+    ctx := context.Background()
+    cfg, err := config.LoadDefaultConfig(ctx)
+    ...
+    fh := firehose.NewFromConfig(cfg)
     fq := firequeue.New(fh, "DELIVERY_STREAM_NAME")
 
-    ctx := context.Background()
     go fq.Loop(ctx) // We should start looping before sending items
 
-    err := fq.Enqueue(&firehose.Record{...})
+    err = fq.Enqueue(types.Record{...})
     ...
 }
 ```
